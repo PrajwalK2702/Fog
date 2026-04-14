@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bank Fraud Detection</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div class="page">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="hicon">
+      <svg viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round"
+          d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6
+             11.955 11.955 0 003 12c0 6.627 5.373 12 12 12s12-5.373
+             12-12c0-2.03-.504-3.942-1.394-5.617"/>
+      </svg>
+    </div>
+    <div>
+      <h1>Bank Fraud Detection</h1>
+      <p>Every submission re-trains all 15 models — results change with each input</p>
+    </div>
+  </div>
+
+  <!-- Form + Result -->
+  <div class="top">
+
+    <!-- Transaction Form -->
+    <div class="card">
+      <div class="card-title">Transaction Input</div>
+      <form method="POST">
+
+        <div class="field">
+          <label for="amount">Transaction Amount ($)</label>
+          <input id="amount" name="amount" type="number" step="0.01"
+                 placeholder="e.g. 450.00" required value="{{ amount }}">
+        </div>
+
+        <div class="field">
+          <label for="type">Transaction Type</label>
+          <select id="type" name="type" required>
+            <option value="" disabled {% if not sel_type %}selected{% endif %}>Select type</option>
+            <option value="0" {% if sel_type=='0' %}selected{% endif %}>0 — Debit</option>
+            <option value="1" {% if sel_type=='1' %}selected{% endif %}>1 — Credit</option>
+            <option value="2" {% if sel_type=='2' %}selected{% endif %}>2 — Transfer</option>
+            <option value="3" {% if sel_type=='3' %}selected{% endif %}>3 — Payment</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="age">Customer Age</label>
+          <input id="age" name="age" type="number" placeholder="e.g. 34"
+                 min="18" max="100" required value="{{ age }}">
+        </div>
+
+        <div class="field">
+          <label for="login">Login Attempts</label>
+          <input id="login" name="login" type="number" placeholder="e.g. 1"
+                 min="1" required value="{{ login }}">
+        </div>
+
+        <div class="field">
+          <label for="balance">Account Balance ($)</label>
+          <input id="balance" name="balance" type="number" step="0.01"
+                 placeholder="e.g. 3200.00" required value="{{ balance }}">
+        </div>
+
+        <button type="submit" class="submit-btn">Run Prediction</button>
+      </form>
+    </div>
+
+    <!-- Result Panel -->
+    <div>
+      {% if error %}
+        <div class="error-box">&#9888; {{ error }}</div>
+
+      {% elif result is not none %}
+        {% set is_fraud = "Fraud" in result %}
+        <div class="result-box {{ 'fraud' if is_fraud else 'safe' }}">
+
+          <div class="verdict">
+            <span class="dot {{ 'dot-r' if is_fraud else 'dot-g' }}"></span>
+            {% if is_fraud %}&#128680;{% else %}&#9989;{% endif %} {{ result }}
+          </div>
+
+          <div class="verdict-sub">
+            {% if is_fraud %}
+              High-risk signals detected — block and escalate for review.
+            {% else %}
+              Transaction appears legitimate. Low risk signals detected.
+            {% endif %}
+          </div>
+
+          <div class="risk-track">
+            <div class="risk-fill" style="
+              width: {{ detail.risk_score }}%;
+              background: {% if detail.risk_score >= 60 %}#f87171{% elif detail.risk_score >= 35 %}#fbbf24{% else %}#4ade80{% endif %};
+            "></div>
+          </div>
+          <div class="risk-label">Risk score: {{ detail.risk_score }}/100</div>
+
+          <div class="detail-grid">
+            <div class="di"><div class="dl">Amount</div><div class="dv">${{ detail.amount }}</div></div>
+            <div class="di"><div class="dl">Balance</div><div class="dv">${{ detail.balance }}</div></div>
+            <div class="di"><div class="dl">Amt / Balance</div><div class="dv">{{ detail.ratio }}%</div></div>
+            <div class="di"><div class="dl">Login Attempts</div><div class="dv">{{ detail.login }}</div></div>
+          </div>
+
+          <div class="best-badge">
+            &#9733; Best model: {{ best_model }} &nbsp;|&nbsp; acc {{ (best_acc * 100)|round(1) }}%
+          </div>
+        </div>
+
+      {% else %}
+        <div class="card">
+          <div class="empty">
+            <div class="empty-arrow">&#8592;</div>
+            Fill in the transaction details<br>
+            and click <strong>Run Prediction</strong><br>
+            to see live results and all 15 model scores.
+          </div>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Model Results Table -->
+  {% if report_data %}
+  <div class="section-label">All 15 Models — Sorted by Accuracy</div>
+  <div class="card">
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Model</th>
+            <th>Accuracy</th>
+            <th>Precision</th>
+            <th>Recall</th>
+            <th>F1 Score</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in report_data %}
+          <tr {% if row.name == best_model %}class="best"{% endif %}>
+            <td>{{ loop.index }}</td>
+            <td class="nm">
+              {{ row.name }}
+              {% if row.name == best_model %}<span class="star">&#9733;</span>{% endif %}
+            </td>
+            <td><span class="pill {% if row.accuracy  >= 0.9 %}ph{% elif row.accuracy  >= 0.7 %}pm{% else %}pl{% endif %}">{{ (row.accuracy *100)|round(1) }}%</span></td>
+            <td><span class="pill {% if row.precision >= 0.9 %}ph{% elif row.precision >= 0.7 %}pm{% else %}pl{% endif %}">{{ (row.precision*100)|round(1) }}%</span></td>
+            <td><span class="pill {% if row.recall    >= 0.9 %}ph{% elif row.recall    >= 0.7 %}pm{% else %}pl{% endif %}">{{ (row.recall   *100)|round(1) }}%</span></td>
+            <td><span class="pill {% if row.f1        >= 0.9 %}ph{% elif row.f1        >= 0.7 %}pm{% else %}pl{% endif %}">{{ (row.f1       *100)|round(1) }}%</span></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Model Comparison Graph -->
+  <div class="card graph-card">
+    <div class="card-title">Model Comparison Graph</div>
+    <img src="/graph" alt="Model Accuracy Comparison Bar Chart">
+  </div>
+  {% endif %}
+
+</div>
+</body>
+</html>
