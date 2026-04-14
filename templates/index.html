@@ -22,7 +22,7 @@
     </div>
     <div>
       <h1>Bank Fraud Detection</h1>
-      <p>Every submission re-trains all 15 models — results change with each input</p>
+      <p>Powered by 15 ML models &mdash; predictions served instantly from cached models</p>
     </div>
   </div>
 
@@ -32,7 +32,7 @@
     <!-- Transaction Form -->
     <div class="card">
       <div class="card-title">Transaction Input</div>
-      <form method="POST">
+      <form method="POST" id="predict-form">
 
         <div class="field">
           <label for="amount">Transaction Amount ($)</label>
@@ -44,10 +44,10 @@
           <label for="type">Transaction Type</label>
           <select id="type" name="type" required>
             <option value="" disabled {% if not sel_type %}selected{% endif %}>Select type</option>
-            <option value="0" {% if sel_type=='0' %}selected{% endif %}>0 — Debit</option>
-            <option value="1" {% if sel_type=='1' %}selected{% endif %}>1 — Credit</option>
-            <option value="2" {% if sel_type=='2' %}selected{% endif %}>2 — Transfer</option>
-            <option value="3" {% if sel_type=='3' %}selected{% endif %}>3 — Payment</option>
+            <option value="0" {% if sel_type=='0' %}selected{% endif %}>0 &mdash; Debit</option>
+            <option value="1" {% if sel_type=='1' %}selected{% endif %}>1 &mdash; Credit</option>
+            <option value="2" {% if sel_type=='2' %}selected{% endif %}>2 &mdash; Transfer</option>
+            <option value="3" {% if sel_type=='3' %}selected{% endif %}>3 &mdash; Payment</option>
           </select>
         </div>
 
@@ -69,7 +69,7 @@
                  placeholder="e.g. 3200.00" required value="{{ balance }}">
         </div>
 
-        <button type="submit" class="submit-btn">Run Prediction</button>
+        <button type="submit" class="submit-btn" id="submit-btn">Run Prediction</button>
       </form>
     </div>
 
@@ -89,7 +89,7 @@
 
           <div class="verdict-sub">
             {% if is_fraud %}
-              High-risk signals detected — block and escalate for review.
+              High-risk signals detected &mdash; block and escalate for review.
             {% else %}
               Transaction appears legitimate. Low risk signals detected.
             {% endif %}
@@ -130,7 +130,7 @@
 
   <!-- Model Results Table -->
   {% if report_data %}
-  <div class="section-label">All 15 Models — Sorted by Accuracy</div>
+  <div class="section-label">All 15 Models &mdash; Sorted by Accuracy</div>
   <div class="card">
     <div class="tbl-wrap">
       <table>
@@ -171,5 +171,15 @@
   {% endif %}
 
 </div>
+
+<!-- Loading spinner on submit -->
+<script>
+  document.getElementById('predict-form').addEventListener('submit', function () {
+    const btn = document.getElementById('submit-btn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Running...';
+  });
+</script>
+
 </body>
 </html>

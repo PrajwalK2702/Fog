@@ -26,28 +26,32 @@ app = Flask(__name__)
 
 # ── Config ───────────────────────────────────────────────────────────────────
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bank_transactions_data.csv')
+DEBUG     = os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
 GRAPH_BUF = None
 
+# ── Model cache (trained once at startup, reused per request) ───────────────
+_cache = {'scaler': None, 'models': None, 'Xte': None, 'yte': None}
+
 MODELS_DEF = [
-    ("Logistic Regression",  LogisticRegression(max_iter=500)),
-    ("Decision Tree",        DecisionTreeClassifier(max_depth=6)),
-    ("Random Forest",        RandomForestClassifier(n_estimators=80)),
+    ("Logistic Regression",  LogisticRegression(max_iter=500, class_weight='balanced')),
+    ("Decision Tree",        DecisionTreeClassifier(max_depth=6, class_weight='balanced')),
+    ("Random Forest",        RandomForestClassifier(n_estimators=80, class_weight='balanced')),
     ("Gradient Boosting",    GradientBoostingClassifier(n_estimators=80)),
     ("AdaBoost",             AdaBoostClassifier(n_estimators=60)),
-    ("Extra Trees",          ExtraTreesClassifier(n_estimators=80)),
+    ("Extra Trees",          ExtraTreesClassifier(n_estimators=80, class_weight='balanced')),
     ("Bagging",              BaggingClassifier(n_estimators=60)),
     ("K-Nearest Neighbors",  KNeighborsClassifier(n_neighbors=7)),
-    ("SVM (RBF)",            SVC(probability=True)),
+    ("SVM (RBF)",            SVC(probability=True, class_weight='balanced')),
     ("Naive Bayes",          GaussianNB()),
     ("LDA",                  LinearDiscriminantAnalysis()),
     ("QDA",                  QuadraticDiscriminantAnalysis()),
-    ("Ridge Classifier",     RidgeClassifier()),
-    ("SGD Classifier",       SGDClassifier(max_iter=500, loss='modified_huber')),
+    ("Ridge Classifier",     RidgeClassifier(class_weight='balanced')),
+    ("SGD Classifier",       SGDClassifier(max_iter=500, loss='modified_huber', class_weight='balanced')),
     ("Voting Ensemble",      None),
 ]
 
 
-# ── Data helpers ─────────────────────────────────────────────────────────────
+# ── Data loader ──────────────────────────────────────────────────────────────
 def load_data():
     df = pd.read_csv(DATA_PATH)
     le = LabelEncoder()
@@ -67,18 +71,19 @@ def load_data():
     return df[features].values, df['Fraud'].values
 
 
-# ── Model runner ─────────────────────────────────────────────────────────────
-def run_models(X, y, input_vec):
+# ── One-time model training (cached) ────────────────────────────────────────
+def build_cache():
+    """Train all models once and store in _cache. Called at startup."""
+    print("  Training all 15 models (one-time)...")
+    X, y = load_data()
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.25, random_state=np.random.randint(0, 9999)
+        X, y, test_size=0.25, random_state=42
     )
     scaler = StandardScaler()
     Xtr    = scaler.fit_transform(X_train)
     Xte    = scaler.transform(X_test)
-    inp    = scaler.transform([input_vec])
 
-    results, trained = [], {}
-
+    trained = {}
     for name, clf in MODELS_DEF:
         if clf is None:
             clf = VotingClassifier(
@@ -91,16 +96,35 @@ def run_models(X, y, input_vec):
             )
         clf = copy.deepcopy(clf)
         clf.fit(Xtr, y_train)
-        y_pred = clf.predict(Xte)
-        pred   = int(clf.predict(inp)[0])
         trained[name] = clf
 
+    _cache['scaler']  = scaler
+    _cache['models']  = trained
+    _cache['Xte']     = Xte
+    _cache['yte']     = y_test
+    print("  Models ready.")
+
+
+# ── Per-request prediction using cached models ────────────────────────────
+def run_predictions(input_vec):
+    """Use cached trained models to predict on a new input vector."""
+    scaler  = _cache['scaler']
+    trained = _cache['models']
+    Xte     = _cache['Xte']
+    yte     = _cache['yte']
+    inp     = scaler.transform([input_vec])
+
+    results = []
+    for name, _ in MODELS_DEF:
+        clf    = trained[name]
+        y_pred = clf.predict(Xte)
+        pred   = int(clf.predict(inp)[0])
         results.append({
             'name':       name,
-            'accuracy':   accuracy_score(y_test, y_pred),
-            'precision':  precision_score(y_test, y_pred, zero_division=0),
-            'recall':     recall_score(y_test, y_pred, zero_division=0),
-            'f1':         f1_score(y_test, y_pred, zero_division=0),
+            'accuracy':   accuracy_score(yte, y_pred),
+            'precision':  precision_score(yte, y_pred, zero_division=0),
+            'recall':     recall_score(yte, y_pred, zero_division=0),
+            'f1':         f1_score(yte, y_pred, zero_division=0),
             'prediction': pred,
         })
 
@@ -174,9 +198,8 @@ def index():
             login   = int(ctx['login'])
             balance = float(ctx['balance'])
 
-            X, y      = load_data()
             input_vec = [amount, t_type, age, login, balance]
-            report    = run_models(X, y, input_vec)
+            report    = run_predictions(input_vec)
 
             best              = report[0]
             ctx['best_model'] = best['name']
@@ -208,7 +231,9 @@ def index():
     return render_template('index.html', **ctx)
 
 
+# ── Startup ──────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     print("\n  Bank Fraud Detection server starting...")
+    build_cache()
     print("  Open this in your browser: http://127.0.0.1:5000\n")
-    app.run(debug=True)
+    app.run(debug=DEBUG)
