@@ -91,10 +91,12 @@
           </div>
 
           <div class="risk-track">
-            <div class="risk-fill" style="
-              width: {{ detail.risk_score }}%;
-              background: {% if is_fraud %}{% if detail.risk_score >= 60 %}#f87171{% else %}#fbbf24{% endif %}{% else %}{% if detail.risk_score >= 60 %}#f87171{% elif detail.risk_score >= 35 %}#fbbf24{% else %}#4ade80{% endif %}{% endif %};
-            "></div>
+            {%- if is_fraud -%}
+              {%- set bar_color = '#f87171' if detail.risk_score >= 60 else '#fbbf24' -%}
+            {%- else -%}
+              {%- set bar_color = '#f87171' if detail.risk_score >= 60 else ('#fbbf24' if detail.risk_score >= 35 else '#4ade80') -%}
+            {%- endif -%}
+            <div class="risk-fill" style="width:{{ detail.risk_score }}%; background:{{ bar_color }};"></div>
           </div>
           <div class="risk-label">Risk score: {{ detail.risk_score }}/100</div>
 
