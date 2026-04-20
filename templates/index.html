@@ -41,9 +41,9 @@
           <select id="type" name="type" required>
             <option value="" disabled {% if not sel_type %}selected{% endif %}>Select type</option>
             <option value="0" {% if sel_type=='0' %}selected{% endif %}>0 &mdash; Credit</option>
-            <option value="1" {% if sel_type=='1' %}selected{% endif %}>1 &mdash; Payment</option>
+            <option value="1" {% if sel_type=='1' %}selected{% endif %}>1 &mdash; Debit</option>
             <option value="2" {% if sel_type=='2' %}selected{% endif %}>2 &mdash; Transfer</option>
-            <option value="3" {% if sel_type=='3' %}selected{% endif %}>3 &mdash; Withdrawal</option>
+            <option value="3" {% if sel_type=='3' %}selected{% endif %}>3 &mdash; Payment</option>
           </select>
         </div>
 
@@ -131,13 +131,8 @@
       <table>
         <thead>
           <tr>
-            <th>#</th>
-            <th>Model</th>
-            <th>Accuracy</th>
-            <th>Precision</th>
-            <th>Recall</th>
-            <th>F1 Score</th>
-            <th>Prediction</th>
+            <th>#</th><th>Model</th><th>Accuracy</th><th>Precision</th>
+            <th>Recall</th><th>F1 Score</th><th>Prediction</th>
           </tr>
         </thead>
         <tbody>

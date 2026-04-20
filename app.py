@@ -8,7 +8,7 @@ import os, io, copy, warnings, threading
 warnings.filterwarnings('ignore')
 
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.linear_model import LogisticRegression, RidgeClassifier, SGDClassifier
 from sklearn.tree import DecisionTreeClassifier
@@ -28,51 +28,68 @@ DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bank_trans
 DEBUG = os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
 
 _graph_lock = threading.Lock()
-_graph_buf = None
+_graph_buf  = None
+_cache = {'scaler': None, 'models': None, 'Xte': None, 'yte': None}
 
-_cache = {'scaler': None, 'models': None, 'Xte': None, 'yte': None, 'type_mapping': None}
-
-# Fixed explicit mapping to match actual CSV transaction types
-TYPE_TO_CODE = {
-    'Credit': 0,
-    'Debit': 1,
+# ---------------------------------------------------------------------
+# UI shows 4 types. They are mapped to 2 training-compatible codes
+# that match the actual CSV values (Credit / Debit).
+#
+#   UI type       | UI code | Training code (CSV-compatible)
+#   Credit        |    0    |   0  (Credit in CSV)
+#   Debit         |    1    |   1  (Debit  in CSV)
+#   Transfer      |    2    |   1  (treated as Debit for training)
+#   Payment       |    3    |   1  (treated as Debit for training)
+#
+# Risk-score logic still uses the full 4-type UI code.
+# ---------------------------------------------------------------------
+UI_TYPES = {
+    0: 'Credit',
+    1: 'Debit',
+    2: 'Transfer',
+    3: 'Payment',
 }
-CODE_TO_TYPE = {v: k for k, v in TYPE_TO_CODE.items()}
+
+# Map UI code → training code used as the model feature
+UI_TO_TRAIN = {0: 0, 1: 1, 2: 1, 3: 1}
+
+# CSV native types → training code
+CSV_TYPE_MAP = {'Credit': 0, 'Debit': 1}
 
 MODELS_DEF = [
-    ("Logistic Regression", LogisticRegression(max_iter=500, class_weight='balanced')),
-    ("Decision Tree", DecisionTreeClassifier(max_depth=6, class_weight='balanced')),
-    ("Random Forest", RandomForestClassifier(n_estimators=80, class_weight='balanced')),
-    ("Gradient Boosting", GradientBoostingClassifier(n_estimators=80)),
-    ("AdaBoost", AdaBoostClassifier(n_estimators=60)),
-    ("Extra Trees", ExtraTreesClassifier(n_estimators=80, class_weight='balanced')),
-    ("Bagging", BaggingClassifier(n_estimators=60)),
-    ("K-Nearest Neighbors", KNeighborsClassifier(n_neighbors=7)),
-    ("SVM (RBF)", SVC(probability=True, class_weight='balanced')),
-    ("Naive Bayes", GaussianNB()),
-    ("LDA", LinearDiscriminantAnalysis(solver='eigen', shrinkage='auto')),
-    ("QDA", QuadraticDiscriminantAnalysis(reg_param=0.5)),
-    ("Ridge Classifier", RidgeClassifier(class_weight='balanced')),
-    ("SGD Classifier", SGDClassifier(max_iter=500, loss='modified_huber', class_weight='balanced')),
-    ("Voting Ensemble", None),
+    ("Logistic Regression",  LogisticRegression(max_iter=500, class_weight='balanced')),
+    ("Decision Tree",        DecisionTreeClassifier(max_depth=6, class_weight='balanced')),
+    ("Random Forest",        RandomForestClassifier(n_estimators=80, class_weight='balanced')),
+    ("Gradient Boosting",    GradientBoostingClassifier(n_estimators=80)),
+    ("AdaBoost",             AdaBoostClassifier(n_estimators=60)),
+    ("Extra Trees",          ExtraTreesClassifier(n_estimators=80, class_weight='balanced')),
+    ("Bagging",              BaggingClassifier(n_estimators=60)),
+    ("K-Nearest Neighbors",  KNeighborsClassifier(n_neighbors=7)),
+    ("SVM (RBF)",            SVC(probability=True, class_weight='balanced')),
+    ("Naive Bayes",          GaussianNB()),
+    ("LDA",                  LinearDiscriminantAnalysis(solver='eigen', shrinkage='auto')),
+    ("QDA",                  QuadraticDiscriminantAnalysis(reg_param=0.5)),
+    ("Ridge Classifier",     RidgeClassifier(class_weight='balanced')),
+    ("SGD Classifier",       SGDClassifier(max_iter=500, loss='modified_huber', class_weight='balanced')),
+    ("Voting Ensemble",      None),
 ]
 
 
 def load_data():
     df = pd.read_csv(DATA_PATH)
-    df['TypeEnc'] = df['TransactionType'].map(TYPE_TO_CODE)
+    df['TypeEnc'] = df['TransactionType'].map(CSV_TYPE_MAP)
     if df['TypeEnc'].isna().any():
         unknown = sorted(df.loc[df['TypeEnc'].isna(), 'TransactionType'].astype(str).unique().tolist())
-        raise ValueError(f"Unknown transaction types in dataset: {unknown}")
+        raise ValueError(f"Unknown CSV transaction types: {unknown}")
     df['TypeEnc'] = df['TypeEnc'].astype(int)
 
-    amt = df['TransactionAmount']
-    bal = df['AccountBalance']
+    amt   = df['TransactionAmount']
+    bal   = df['AccountBalance']
     login = df['LoginAttempts']
-    is_debit_type = (df['TypeEnc'] == TYPE_TO_CODE['Debit']).astype(int)
+    is_debit = (df['TypeEnc'] == 1).astype(int)
 
     score = (
-        ((amt / (bal + 1)) > 0.6).astype(int) * 2 * is_debit_type +
+        ((amt / (bal + 1)) > 0.6).astype(int) * 2 * is_debit +
         (login > 3).astype(int) * 2 +
         (amt > amt.quantile(0.97)).astype(int) +
         (bal < bal.quantile(0.05)).astype(int)
@@ -86,30 +103,22 @@ def build_cache():
     print("  Training all 15 models (one-time)...")
     X, y = load_data()
 
-    fraud_count = int(y.sum())
-    n_features = X.shape[1]
-    if fraud_count < n_features:
-        print(f"  WARNING: Only {fraud_count} fraud samples for {n_features} features. Lowering threshold...")
+    if int(y.sum()) < X.shape[1]:
+        print(f"  WARNING: very few fraud samples, lowering threshold...")
         df = pd.read_csv(DATA_PATH)
-        df['TypeEnc'] = df['TransactionType'].map(TYPE_TO_CODE)
-        if df['TypeEnc'].isna().any():
-            unknown = sorted(df.loc[df['TypeEnc'].isna(), 'TransactionType'].astype(str).unique().tolist())
-            raise ValueError(f"Unknown transaction types in dataset: {unknown}")
-        df['TypeEnc'] = df['TypeEnc'].astype(int)
-
-        amt = df['TransactionAmount']
-        bal = df['AccountBalance']
+        df['TypeEnc'] = df['TransactionType'].map(CSV_TYPE_MAP).astype(int)
+        amt   = df['TransactionAmount']
+        bal   = df['AccountBalance']
         login = df['LoginAttempts']
-        is_debit_type = (df['TypeEnc'] == TYPE_TO_CODE['Debit']).astype(int)
+        is_debit = (df['TypeEnc'] == 1).astype(int)
         score = (
-            ((amt / (bal + 1)) > 0.6).astype(int) * 2 * is_debit_type +
+            ((amt / (bal + 1)) > 0.6).astype(int) * 2 * is_debit +
             (login > 3).astype(int) * 2 +
             (amt > amt.quantile(0.97)).astype(int) +
             (bal < bal.quantile(0.05)).astype(int)
         )
         df['Fraud'] = (score >= 3).astype(int)
-        features = ['TransactionAmount', 'TypeEnc', 'CustomerAge', 'LoginAttempts', 'AccountBalance']
-        X = df[features].values
+        X = df[['TransactionAmount', 'TypeEnc', 'CustomerAge', 'LoginAttempts', 'AccountBalance']].values
         y = df['Fraud'].values
         print(f"  Fraud samples after adjustment: {int(y.sum())}")
 
@@ -131,61 +140,58 @@ def build_cache():
                 ],
                 voting='soft'
             )
-            clf.fit(Xtr, y_train)
         else:
             clf = copy.deepcopy(clf)
-            clf.fit(Xtr, y_train)
+        clf.fit(Xtr, y_train)
         trained[name] = clf
 
     _cache['scaler'] = scaler
     _cache['models'] = trained
-    _cache['Xte'] = Xte
-    _cache['yte'] = y_test
-    _cache['type_mapping'] = CODE_TO_TYPE
+    _cache['Xte']    = Xte
+    _cache['yte']    = y_test
     print("  Models ready.")
 
 
 def run_predictions(input_vec):
-    scaler = _cache['scaler']
+    scaler  = _cache['scaler']
     trained = _cache['models']
-    Xte = _cache['Xte']
-    yte = _cache['yte']
-    inp = scaler.transform([input_vec])
+    Xte     = _cache['Xte']
+    yte     = _cache['yte']
+    inp     = scaler.transform([input_vec])
 
     results = []
     for name, _ in MODELS_DEF:
-        clf = trained[name]
+        clf    = trained[name]
         y_pred = clf.predict(Xte)
-        pred = int(clf.predict(inp)[0])
+        pred   = int(clf.predict(inp)[0])
         results.append({
-            'name': name,
-            'accuracy': accuracy_score(yte, y_pred),
-            'precision': precision_score(yte, y_pred, zero_division=0),
-            'recall': recall_score(yte, y_pred, zero_division=0),
-            'f1': f1_score(yte, y_pred, zero_division=0),
+            'name':       name,
+            'accuracy':   accuracy_score(yte, y_pred),
+            'precision':  precision_score(yte, y_pred, zero_division=0),
+            'recall':     recall_score(yte, y_pred, zero_division=0),
+            'f1':         f1_score(yte, y_pred, zero_division=0),
             'prediction': pred,
         })
-
     results.sort(key=lambda r: r['accuracy'], reverse=True)
     return results
 
 
 def make_graph(report_data):
     global _graph_buf
-    names = [r['name'] for r in report_data]
-    accs = [r['accuracy'] for r in report_data]
+    names = [r['name']      for r in report_data]
+    accs  = [r['accuracy']  for r in report_data]
     precs = [r['precision'] for r in report_data]
-    recs = [r['recall'] for r in report_data]
-    f1s = [r['f1'] for r in report_data]
+    recs  = [r['recall']    for r in report_data]
+    f1s   = [r['f1']        for r in report_data]
 
     x, w = np.arange(len(names)), 0.2
     fig, ax = plt.subplots(figsize=(14, 5))
     fig.patch.set_facecolor('#131929')
     ax.set_facecolor('#1a2236')
-    ax.bar(x - 1.5*w, accs, w, label='Accuracy', color='#38bdf8', alpha=0.85)
+    ax.bar(x - 1.5*w, accs,  w, label='Accuracy',  color='#38bdf8', alpha=0.85)
     ax.bar(x - 0.5*w, precs, w, label='Precision', color='#4ade80', alpha=0.85)
-    ax.bar(x + 0.5*w, recs, w, label='Recall', color='#fbbf24', alpha=0.85)
-    ax.bar(x + 1.5*w, f1s, w, label='F1 Score', color='#f87171', alpha=0.85)
+    ax.bar(x + 0.5*w, recs,  w, label='Recall',    color='#fbbf24', alpha=0.85)
+    ax.bar(x + 1.5*w, f1s,   w, label='F1 Score',  color='#f87171', alpha=0.85)
     ax.set_xticks(x)
     ax.set_xticklabels(names, rotation=35, ha='right', color='#94a3b8', fontsize=9)
     ax.set_ylim(0, 1.12)
@@ -196,7 +202,6 @@ def make_graph(report_data):
     ax.set_axisbelow(True)
     ax.legend(facecolor='#0b0f1a', edgecolor='#1e293b', labelcolor='#e2e8f0', fontsize=9)
     plt.tight_layout()
-
     buf = io.BytesIO()
     plt.savefig(buf, format='png', dpi=130, bbox_inches='tight', facecolor=fig.get_facecolor())
     plt.close()
@@ -223,17 +228,17 @@ def index():
     )
 
     if request.method == 'POST':
-        ctx['amount'] = request.form.get('amount', '')
+        ctx['amount']   = request.form.get('amount', '')
         ctx['sel_type'] = request.form.get('type', '')
-        ctx['age'] = request.form.get('age', '')
-        ctx['login'] = request.form.get('login', '')
-        ctx['balance'] = request.form.get('balance', '')
+        ctx['age']      = request.form.get('age', '')
+        ctx['login']    = request.form.get('login', '')
+        ctx['balance']  = request.form.get('balance', '')
 
         try:
-            amount = float(ctx['amount'])
-            t_type = int(ctx['sel_type'])
-            age = int(ctx['age'])
-            login = int(ctx['login'])
+            amount  = float(ctx['amount'])
+            ui_type = int(ctx['sel_type'])
+            age     = int(ctx['age'])
+            login   = int(ctx['login'])
             balance = float(ctx['balance'])
 
             if amount <= 0:
@@ -244,42 +249,46 @@ def index():
                 raise ValueError("Customer age must be between 18 and 100.")
             if login < 0:
                 raise ValueError("Login attempts cannot be negative.")
-            if t_type not in CODE_TO_TYPE:
+            if ui_type not in UI_TYPES:
                 raise ValueError("Invalid transaction type selected.")
 
-            input_vec = [amount, t_type, age, login, balance]
-            report = run_predictions(input_vec)
+            # Use training-compatible code as the model feature
+            train_type = UI_TO_TRAIN[ui_type]
+            input_vec  = [amount, train_type, age, login, balance]
+            report     = run_predictions(input_vec)
 
             best = report[0]
             ctx['best_model'] = best['name']
-            ctx['best_acc'] = best['accuracy']
+            ctx['best_acc']   = best['accuracy']
 
-            votes = sum(1 for r in report if r['prediction'] == 1)
+            votes    = sum(1 for r in report if r['prediction'] == 1)
             is_fraud = votes > len(report) / 2
             ctx['result'] = "Fraud Detected" if is_fraud else "Legitimate Transaction"
 
             ratio = round((amount / (balance + 1)) * 100, 1)
 
-            if t_type == TYPE_TO_CODE['Credit']:
+            # Risk score: full 4-type logic using the original UI code
+            if ui_type == 0:   # Credit — money coming in, no ratio penalty
                 ratio_penalty = 0
-            else:  # Debit
+            elif ui_type == 3:  # Payment — normal everyday spend, no ratio penalty
+                ratio_penalty = 0
+            elif ui_type == 2:  # Transfer — flag only if extreme (>150%)
+                ratio_penalty = 25 if ratio > 150 else 0
+            else:               # Debit — flag if ratio > 80%
                 ratio_penalty = 20 if ratio > 80 else 0
 
-            login_risk = min(max(login - 3, 0) * 5, 35) if login > 3 else 0
+            login_risk       = min(max(login - 3, 0) * 5, 35) if login > 3 else 0
             low_balance_risk = 10 if balance < 500 else 0
             high_amount_risk = 20 if amount > 10000 else (10 if amount > 5000 else 0)
 
             ctx['detail'] = {
-                'amount': f"{amount:,.2f}",
-                'balance': f"{balance:,.2f}",
-                'ratio': ratio,
-                'login': login,
-                'type': CODE_TO_TYPE[t_type],
+                'amount':     f"{amount:,.2f}",
+                'balance':    f"{balance:,.2f}",
+                'ratio':      ratio,
+                'login':      login,
+                'type':       UI_TYPES[ui_type],
                 'risk_score': min(100, int(
-                    ratio_penalty +
-                    login_risk +
-                    high_amount_risk +
-                    low_balance_risk
+                    ratio_penalty + login_risk + high_amount_risk + low_balance_risk
                 )),
             }
             ctx['report_data'] = report
