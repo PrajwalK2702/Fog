@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import os, io, copy, warnings
+import os, io, copy, warnings, threading
 warnings.filterwarnings('ignore')
 
 from sklearn.model_selection import train_test_split
@@ -27,9 +27,12 @@ app = Flask(__name__)
 # ── Config ───────────────────────────────────────────────────────────────────
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bank_transactions_data.csv')
 DEBUG     = os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
-GRAPH_BUF = None
 
-# ── Model cache (trained once at startup, reused per request) ───────────────
+# FIX 8: Thread-safe graph buffer using a lock
+_graph_lock = threading.Lock()
+_graph_buf  = None
+
+# ── Model cache (trained once at startup, reused per request) ────────────────
 _cache = {'scaler': None, 'models': None, 'Xte': None, 'yte': None}
 
 MODELS_DEF = [
@@ -41,13 +44,14 @@ MODELS_DEF = [
     ("Extra Trees",          ExtraTreesClassifier(n_estimators=80, class_weight='balanced')),
     ("Bagging",              BaggingClassifier(n_estimators=60)),
     ("K-Nearest Neighbors",  KNeighborsClassifier(n_neighbors=7)),
+    # FIX 5: SVC with probability=True only — RidgeClassifier removed from soft-voting ensemble
     ("SVM (RBF)",            SVC(probability=True, class_weight='balanced')),
     ("Naive Bayes",          GaussianNB()),
     ("LDA",                  LinearDiscriminantAnalysis()),
     ("QDA",                  QuadraticDiscriminantAnalysis()),
     ("Ridge Classifier",     RidgeClassifier(class_weight='balanced')),
     ("SGD Classifier",       SGDClassifier(max_iter=500, loss='modified_huber', class_weight='balanced')),
-    ("Voting Ensemble",      None),
+    ("Voting Ensemble",      None),   # built after others are trained
 ]
 
 
@@ -59,8 +63,14 @@ def load_data():
     amt   = df['TransactionAmount']
     bal   = df['AccountBalance']
     login = df['LoginAttempts']
+
+    # FIX 2: Skip amount/balance ratio check for Credit transactions (TypeEnc == 1)
+    # Credit adds money — spending ratio is irrelevant and caused false positives
+    is_not_credit = (df['TypeEnc'] != 1).astype(int)
+
+    # FIX 4: Use consistent smoothing (+1) everywhere
     score = (
-        ((amt / (bal + 1)) > 0.6).astype(int) * 2 +
+        ((amt / (bal + 1)) > 0.6).astype(int) * 2 * is_not_credit +
         (login > 3).astype(int) * 2 +
         (amt > amt.quantile(0.97)).astype(int) +
         (bal < bal.quantile(0.05)).astype(int) +
@@ -86,6 +96,9 @@ def build_cache():
     trained = {}
     for name, clf in MODELS_DEF:
         if clf is None:
+            # FIX 1: VotingClassifier built AFTER RF, GB, LR are already trained
+            # Use the already-fitted instances directly — no deepcopy needed here
+            # voting='soft' requires predict_proba — only use models that support it
             clf = VotingClassifier(
                 estimators=[
                     ('rf', trained['Random Forest']),
@@ -94,8 +107,11 @@ def build_cache():
                 ],
                 voting='soft'
             )
-        clf = copy.deepcopy(clf)
-        clf.fit(Xtr, y_train)
+            # VotingClassifier must be re-fitted even when using pre-trained estimators
+            clf.fit(Xtr, y_train)
+        else:
+            clf = copy.deepcopy(clf)
+            clf.fit(Xtr, y_train)
         trained[name] = clf
 
     _cache['scaler']  = scaler
@@ -134,7 +150,7 @@ def run_predictions(input_vec):
 
 # ── Graph generator ──────────────────────────────────────────────────────────
 def make_graph(report_data):
-    global GRAPH_BUF
+    global _graph_buf
     names = [r['name']      for r in report_data]
     accs  = [r['accuracy']  for r in report_data]
     precs = [r['precision'] for r in report_data]
@@ -164,20 +180,24 @@ def make_graph(report_data):
     plt.savefig(buf, format='png', dpi=130, bbox_inches='tight', facecolor=fig.get_facecolor())
     plt.close()
     buf.seek(0)
-    GRAPH_BUF = buf.read()
+    # FIX 8: Thread-safe write using lock
+    with _graph_lock:
+        _graph_buf = buf.read()
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 @app.route('/graph')
 def serve_graph():
-    if GRAPH_BUF is None:
+    # FIX 8: Thread-safe read using lock
+    with _graph_lock:
+        data = _graph_buf
+    if data is None:
         return Response(status=204)
-    return Response(GRAPH_BUF, mimetype='image/png')
+    return Response(data, mimetype='image/png')
 
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
-    global GRAPH_BUF
     ctx = dict(
         result=None, detail=None, best_model=None, best_acc=None,
         report_data=None, error=None,
@@ -198,6 +218,16 @@ def index():
             login   = int(ctx['login'])
             balance = float(ctx['balance'])
 
+            # FIX 10: Validate negative values
+            if amount <= 0:
+                raise ValueError("Transaction amount must be greater than zero.")
+            if balance < 0:
+                raise ValueError("Account balance cannot be negative.")
+            if age < 18 or age > 100:
+                raise ValueError("Customer age must be between 18 and 100.")
+            if login < 0:
+                raise ValueError("Login attempts cannot be negative.")
+
             input_vec = [amount, t_type, age, login, balance]
             report    = run_predictions(input_vec)
 
@@ -209,24 +239,32 @@ def index():
             is_fraud = votes > len(report) / 2
             ctx['result'] = "Fraud Detected" if is_fraud else "Legitimate Transaction"
 
-            ratio = round((amount / (balance + 0.01)) * 100, 1)
+            # FIX 4: Consistent smoothing (+1) matching load_data()
+            ratio = round((amount / (balance + 1)) * 100, 1)
+
+            # FIX 3: Skip ratio penalty for Credit transactions (t_type == 1)
+            ratio_penalty = (ratio > 60 and t_type != 1) * 30
+
             ctx['detail'] = {
                 'amount':     f"{amount:,.2f}",
                 'balance':    f"{balance:,.2f}",
                 'ratio':      ratio,
                 'login':      login,
+                'type':       t_type,
                 'risk_score': min(100, int(
-                    (ratio > 60) * 30 +
-                    (login > 3)  * 30 +
-                    (amount > 5000) * 20 +
-                    (balance < 500) * 20
+                    ratio_penalty +
+                    (login > 3)        * 30 +
+                    (amount > 5000)    * 20 +
+                    (balance < 500)    * 20
                 )),
             }
             ctx['report_data'] = report
             make_graph(report)
 
-        except Exception as e:
+        except ValueError as e:
             ctx['error'] = str(e)
+        except Exception as e:
+            ctx['error'] = f"Unexpected error: {str(e)}"
 
     return render_template('index.html', **ctx)
 
