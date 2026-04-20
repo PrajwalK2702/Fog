@@ -32,12 +32,10 @@ _graph_buf = None
 
 _cache = {'scaler': None, 'models': None, 'Xte': None, 'yte': None, 'type_mapping': None}
 
-# Fixed explicit mapping to match training data labels, avoiding LabelEncoder/UI mismatches
+# Fixed explicit mapping to match actual CSV transaction types
 TYPE_TO_CODE = {
     'Credit': 0,
-    'Payment': 1,
-    'Transfer': 2,
-    'Withdrawal': 3,
+    'Debit': 1,
 }
 CODE_TO_TYPE = {v: k for k, v in TYPE_TO_CODE.items()}
 
@@ -71,7 +69,7 @@ def load_data():
     amt = df['TransactionAmount']
     bal = df['AccountBalance']
     login = df['LoginAttempts']
-    is_debit_type = df['TypeEnc'].isin([TYPE_TO_CODE['Withdrawal'], TYPE_TO_CODE['Transfer']]).astype(int)
+    is_debit_type = (df['TypeEnc'] == TYPE_TO_CODE['Debit']).astype(int)
 
     score = (
         ((amt / (bal + 1)) > 0.6).astype(int) * 2 * is_debit_type +
@@ -102,7 +100,7 @@ def build_cache():
         amt = df['TransactionAmount']
         bal = df['AccountBalance']
         login = df['LoginAttempts']
-        is_debit_type = df['TypeEnc'].isin([TYPE_TO_CODE['Withdrawal'], TYPE_TO_CODE['Transfer']]).astype(int)
+        is_debit_type = (df['TypeEnc'] == TYPE_TO_CODE['Debit']).astype(int)
         score = (
             ((amt / (bal + 1)) > 0.6).astype(int) * 2 * is_debit_type +
             (login > 3).astype(int) * 2 +
@@ -262,11 +260,9 @@ def index():
 
             ratio = round((amount / (balance + 1)) * 100, 1)
 
-            if t_type in (TYPE_TO_CODE['Payment'], TYPE_TO_CODE['Credit']):
+            if t_type == TYPE_TO_CODE['Credit']:
                 ratio_penalty = 0
-            elif t_type == TYPE_TO_CODE['Transfer']:
-                ratio_penalty = 25 if ratio > 150 else 0
-            else:
+            else:  # Debit
                 ratio_penalty = 20 if ratio > 80 else 0
 
             login_risk = min(max(login - 3, 0) * 5, 35) if login > 3 else 0
