@@ -42,6 +42,7 @@ _cache = {'scaler': None, 'models': None, 'Xte': None, 'yte': None}
 #   Payment       |    3    |   1  (treated as Debit for training)
 #
 # Risk-score logic still uses the full 4-type UI code.
+# Final verdict uses accuracy-weighted vote (not simple majority).
 # ---------------------------------------------------------------------
 UI_TYPES = {
     0: 'Credit',
@@ -50,10 +51,7 @@ UI_TYPES = {
     3: 'Payment',
 }
 
-# Map UI code → training code used as the model feature
 UI_TO_TRAIN = {0: 0, 1: 1, 2: 1, 3: 1}
-
-# CSV native types → training code
 CSV_TYPE_MAP = {'Credit': 0, 'Debit': 1}
 
 MODELS_DEF = [
@@ -164,9 +162,10 @@ def run_predictions(input_vec):
         clf    = trained[name]
         y_pred = clf.predict(Xte)
         pred   = int(clf.predict(inp)[0])
+        acc    = accuracy_score(yte, y_pred)
         results.append({
             'name':       name,
-            'accuracy':   accuracy_score(yte, y_pred),
+            'accuracy':   acc,
             'precision':  precision_score(yte, y_pred, zero_division=0),
             'recall':     recall_score(yte, y_pred, zero_division=0),
             'f1':         f1_score(yte, y_pred, zero_division=0),
@@ -174,6 +173,20 @@ def run_predictions(input_vec):
         })
     results.sort(key=lambda r: r['accuracy'], reverse=True)
     return results
+
+
+def weighted_verdict(report):
+    """
+    Accuracy-weighted vote.
+    Each model contributes its accuracy as its vote weight.
+    If weighted fraud score > 0.5 * total weight → Fraud.
+    Also returns fraud_weight_pct (0-100) used to boost risk score.
+    """
+    total_weight  = sum(r['accuracy'] for r in report)
+    fraud_weight  = sum(r['accuracy'] for r in report if r['prediction'] == 1)
+    fraud_pct     = fraud_weight / total_weight if total_weight > 0 else 0
+    is_fraud      = fraud_pct > 0.5
+    return is_fraud, round(fraud_pct * 100, 1)
 
 
 def make_graph(report_data):
@@ -252,7 +265,6 @@ def index():
             if ui_type not in UI_TYPES:
                 raise ValueError("Invalid transaction type selected.")
 
-            # Use training-compatible code as the model feature
             train_type = UI_TO_TRAIN[ui_type]
             input_vec  = [amount, train_type, age, login, balance]
             report     = run_predictions(input_vec)
@@ -261,25 +273,35 @@ def index():
             ctx['best_model'] = best['name']
             ctx['best_acc']   = best['accuracy']
 
-            votes    = sum(1 for r in report if r['prediction'] == 1)
-            is_fraud = votes > len(report) / 2
-            ctx['result'] = "Fraud Detected" if is_fraud else "Legitimate Transaction"
+            # ── Accuracy-weighted verdict ──────────────────────────────
+            is_fraud, fraud_weight_pct = weighted_verdict(report)
+            ctx['result']           = "Fraud Detected" if is_fraud else "Legitimate Transaction"
+            ctx['fraud_weight_pct'] = fraud_weight_pct
 
             ratio = round((amount / (balance + 1)) * 100, 1)
 
-            # Risk score: full 4-type logic using the original UI code
-            if ui_type == 0:   # Credit — money coming in, no ratio penalty
+            # ── Rule-based risk signals ────────────────────────────────
+            if ui_type == 0:
                 ratio_penalty = 0
-            elif ui_type == 3:  # Payment — normal everyday spend, no ratio penalty
+            elif ui_type == 3:
                 ratio_penalty = 0
-            elif ui_type == 2:  # Transfer — flag only if extreme (>150%)
+            elif ui_type == 2:
                 ratio_penalty = 25 if ratio > 150 else 0
-            else:               # Debit — flag if ratio > 80%
+            else:
                 ratio_penalty = 20 if ratio > 80 else 0
 
             login_risk       = min(max(login - 3, 0) * 5, 35) if login > 3 else 0
             low_balance_risk = 10 if balance < 500 else 0
             high_amount_risk = 20 if amount > 10000 else (10 if amount > 5000 else 0)
+
+            # ── ML consensus boost ────────────────────────────────────
+            # If the weighted ML vote is > 50% fraud, add up to +30 pts
+            # proportional to how strong the consensus is (50%→0, 100%→30).
+            ml_boost = 0
+            if fraud_weight_pct > 50:
+                ml_boost = int(((fraud_weight_pct - 50) / 50) * 30)
+
+            raw_score = ratio_penalty + login_risk + high_amount_risk + low_balance_risk + ml_boost
 
             ctx['detail'] = {
                 'amount':     f"{amount:,.2f}",
@@ -287,9 +309,8 @@ def index():
                 'ratio':      ratio,
                 'login':      login,
                 'type':       UI_TYPES[ui_type],
-                'risk_score': min(100, int(
-                    ratio_penalty + login_risk + high_amount_risk + low_balance_risk
-                )),
+                'risk_score': min(100, raw_score),
+                'ml_boost':   ml_boost,
             }
             ctx['report_data'] = report
             make_graph(report)
