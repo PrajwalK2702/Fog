@@ -28,7 +28,7 @@ app = Flask(__name__)
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bank_transactions_data.csv')
 DEBUG     = os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
 
-# FIX 8: Thread-safe graph buffer using a lock
+# Thread-safe graph buffer
 _graph_lock = threading.Lock()
 _graph_buf  = None
 
@@ -44,7 +44,6 @@ MODELS_DEF = [
     ("Extra Trees",          ExtraTreesClassifier(n_estimators=80, class_weight='balanced')),
     ("Bagging",              BaggingClassifier(n_estimators=60)),
     ("K-Nearest Neighbors",  KNeighborsClassifier(n_neighbors=7)),
-    # FIX 5: SVC with probability=True only — RidgeClassifier removed from soft-voting ensemble
     ("SVM (RBF)",            SVC(probability=True, class_weight='balanced')),
     ("Naive Bayes",          GaussianNB()),
     ("LDA",                  LinearDiscriminantAnalysis()),
@@ -64,19 +63,22 @@ def load_data():
     bal   = df['AccountBalance']
     login = df['LoginAttempts']
 
-    # FIX 2: Skip amount/balance ratio check for Credit transactions (TypeEnc == 1)
-    # Credit adds money — spending ratio is irrelevant and caused false positives
-    is_not_credit = (df['TypeEnc'] != 1).astype(int)
+    # FIX 1: Only apply ratio penalty for Withdrawal (0) and Transfer (2).
+    # Credit (1) adds money — ratio check irrelevant.
+    # Payment (3) is a normal spend — should NOT be auto-penalised.
+    is_debit_type = df['TypeEnc'].isin([0, 2]).astype(int)
 
-    # FIX 4: Use consistent smoothing (+1) everywhere
+    # FIX 2: Removed (TypeEnc == 2) bonus point — being a Transfer is NOT
+    # itself evidence of fraud; it caused every normal Transfer to be flagged.
+    # FIX 3: Raised fraud threshold from >= 3 to >= 4 to reduce false positives
+    # for legitimate high-value Transfers and Payments.
     score = (
-        ((amt / (bal + 1)) > 0.6).astype(int) * 2 * is_not_credit +
+        ((amt / (bal + 1)) > 0.6).astype(int) * 2 * is_debit_type +
         (login > 3).astype(int) * 2 +
         (amt > amt.quantile(0.97)).astype(int) +
-        (bal < bal.quantile(0.05)).astype(int) +
-        (df['TypeEnc'] == 2).astype(int)
+        (bal < bal.quantile(0.05)).astype(int)
     )
-    df['Fraud'] = (score >= 3).astype(int)
+    df['Fraud'] = (score >= 4).astype(int)
     features = ['TransactionAmount', 'TypeEnc', 'CustomerAge', 'LoginAttempts', 'AccountBalance']
     return df[features].values, df['Fraud'].values
 
@@ -96,8 +98,7 @@ def build_cache():
     trained = {}
     for name, clf in MODELS_DEF:
         if clf is None:
-            # FIX 1: VotingClassifier built AFTER RF, GB, LR are already trained
-            # Use the already-fitted instances directly — no deepcopy needed here
+            # VotingClassifier built AFTER RF, GB, LR are already trained
             # voting='soft' requires predict_proba — only use models that support it
             clf = VotingClassifier(
                 estimators=[
@@ -107,7 +108,6 @@ def build_cache():
                 ],
                 voting='soft'
             )
-            # VotingClassifier must be re-fitted even when using pre-trained estimators
             clf.fit(Xtr, y_train)
         else:
             clf = copy.deepcopy(clf)
@@ -180,7 +180,6 @@ def make_graph(report_data):
     plt.savefig(buf, format='png', dpi=130, bbox_inches='tight', facecolor=fig.get_facecolor())
     plt.close()
     buf.seek(0)
-    # FIX 8: Thread-safe write using lock
     with _graph_lock:
         _graph_buf = buf.read()
 
@@ -188,7 +187,6 @@ def make_graph(report_data):
 # ── Routes ───────────────────────────────────────────────────────────────────
 @app.route('/graph')
 def serve_graph():
-    # FIX 8: Thread-safe read using lock
     with _graph_lock:
         data = _graph_buf
     if data is None:
@@ -218,7 +216,7 @@ def index():
             login   = int(ctx['login'])
             balance = float(ctx['balance'])
 
-            # FIX 10: Validate negative values
+            # Input validation
             if amount <= 0:
                 raise ValueError("Transaction amount must be greater than zero.")
             if balance < 0:
@@ -239,11 +237,17 @@ def index():
             is_fraud = votes > len(report) / 2
             ctx['result'] = "Fraud Detected" if is_fraud else "Legitimate Transaction"
 
-            # FIX 4: Consistent smoothing (+1) matching load_data()
+            # Consistent smoothing (+1) matching load_data()
             ratio = round((amount / (balance + 1)) * 100, 1)
 
-            # FIX 3: Skip ratio penalty for Credit transactions (t_type == 1)
-            ratio_penalty = (ratio > 60 and t_type != 1) * 30
+            # FIX 4: Ratio penalty only for Withdrawal (0) and Transfer (2)
+            # Payment (3) and Credit (1) do NOT get ratio penalty
+            ratio_penalty = (ratio > 60 and t_type in [0, 2]) * 30
+
+            # FIX 5: Login risk scales with actual attempts (capped at 10)
+            # Old: flat 30 pts for any login > 3
+            # New: proportional — 5 pts per attempt above 3, max 35 pts
+            login_risk = min(max(login - 3, 0) * 5, 35) if login > 3 else 0
 
             ctx['detail'] = {
                 'amount':     f"{amount:,.2f}",
@@ -253,7 +257,7 @@ def index():
                 'type':       t_type,
                 'risk_score': min(100, int(
                     ratio_penalty +
-                    (login > 3)        * 30 +
+                    login_risk +
                     (amount > 5000)    * 20 +
                     (balance < 500)    * 20
                 )),
