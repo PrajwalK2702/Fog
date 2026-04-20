@@ -46,8 +46,11 @@ MODELS_DEF = [
     ("K-Nearest Neighbors",  KNeighborsClassifier(n_neighbors=7)),
     ("SVM (RBF)",            SVC(probability=True, class_weight='balanced')),
     ("Naive Bayes",          GaussianNB()),
-    ("LDA",                  LinearDiscriminantAnalysis()),
-    ("QDA",                  QuadraticDiscriminantAnalysis()),
+    # FIX: LDA with eigen solver + shrinkage handles small fraud class safely
+    ("LDA",                  LinearDiscriminantAnalysis(solver='eigen', shrinkage='auto')),
+    # FIX: QDA reg_param=0.5 regularises covariance so it works even when
+    #      fraud samples < number of features (avoids LinAlgError)
+    ("QDA",                  QuadraticDiscriminantAnalysis(reg_param=0.5)),
     ("Ridge Classifier",     RidgeClassifier(class_weight='balanced')),
     ("SGD Classifier",       SGDClassifier(max_iter=500, loss='modified_huber', class_weight='balanced')),
     ("Voting Ensemble",      None),   # built after others are trained
@@ -63,15 +66,13 @@ def load_data():
     bal   = df['AccountBalance']
     login = df['LoginAttempts']
 
-    # FIX 1: Only apply ratio penalty for Withdrawal (0) and Transfer (2).
-    # Credit (1) adds money — ratio check irrelevant.
-    # Payment (3) is a normal spend — should NOT be auto-penalised.
+    # Only apply ratio penalty for Withdrawal (0) and Transfer (2).
+    # Credit (1) adds money — ratio irrelevant.
+    # Payment (3) is normal spend — should NOT be auto-penalised.
     is_debit_type = df['TypeEnc'].isin([0, 2]).astype(int)
 
-    # FIX 2: Removed (TypeEnc == 2) bonus point — being a Transfer is NOT
-    # itself evidence of fraud; it caused every normal Transfer to be flagged.
-    # FIX 3: Raised fraud threshold from >= 3 to >= 4 to reduce false positives
-    # for legitimate high-value Transfers and Payments.
+    # Removed (TypeEnc == 2) bonus point — being a Transfer alone is NOT fraud.
+    # Threshold raised from >= 3 to >= 4 to reduce false positives.
     score = (
         ((amt / (bal + 1)) > 0.6).astype(int) * 2 * is_debit_type +
         (login > 3).astype(int) * 2 +
@@ -83,13 +84,40 @@ def load_data():
     return df[features].values, df['Fraud'].values
 
 
-# ── One-time model training (cached) ────────────────────────────────────────
+# ── One-time model training (cached) ─────────────────────────────────────────
 def build_cache():
     """Train all models once and store in _cache. Called at startup."""
     print("  Training all 15 models (one-time)...")
     X, y = load_data()
+
+    # Safety check: ensure enough fraud samples exist for QDA/LDA
+    fraud_count = int(y.sum())
+    n_features  = X.shape[1]
+    if fraud_count < n_features:
+        print(f"  WARNING: Only {fraud_count} fraud samples for {n_features} features.")
+        print("  Adjusting fraud threshold to ensure sufficient training samples...")
+        # Lower threshold to generate more fraud labels if dataset is too clean
+        df = pd.read_csv(DATA_PATH)
+        le = LabelEncoder()
+        df['TypeEnc'] = le.fit_transform(df['TransactionType'].astype(str))
+        amt   = df['TransactionAmount']
+        bal   = df['AccountBalance']
+        login = df['LoginAttempts']
+        is_debit_type = df['TypeEnc'].isin([0, 2]).astype(int)
+        score = (
+            ((amt / (bal + 1)) > 0.6).astype(int) * 2 * is_debit_type +
+            (login > 3).astype(int) * 2 +
+            (amt > amt.quantile(0.97)).astype(int) +
+            (bal < bal.quantile(0.05)).astype(int)
+        )
+        df['Fraud'] = (score >= 3).astype(int)   # fallback: slightly lower threshold
+        features = ['TransactionAmount', 'TypeEnc', 'CustomerAge', 'LoginAttempts', 'AccountBalance']
+        X = df[features].values
+        y = df['Fraud'].values
+        print(f"  Fraud samples after adjustment: {int(y.sum())}")
+
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.25, random_state=42
+        X, y, test_size=0.25, random_state=42, stratify=y
     )
     scaler = StandardScaler()
     Xtr    = scaler.fit_transform(X_train)
@@ -99,7 +127,6 @@ def build_cache():
     for name, clf in MODELS_DEF:
         if clf is None:
             # VotingClassifier built AFTER RF, GB, LR are already trained
-            # voting='soft' requires predict_proba — only use models that support it
             clf = VotingClassifier(
                 estimators=[
                     ('rf', trained['Random Forest']),
@@ -121,7 +148,7 @@ def build_cache():
     print("  Models ready.")
 
 
-# ── Per-request prediction using cached models ────────────────────────────
+# ── Per-request prediction using cached models ────────────────────────────────
 def run_predictions(input_vec):
     """Use cached trained models to predict on a new input vector."""
     scaler  = _cache['scaler']
@@ -148,7 +175,7 @@ def run_predictions(input_vec):
     return results
 
 
-# ── Graph generator ──────────────────────────────────────────────────────────
+# ── Graph generator ───────────────────────────────────────────────────────────
 def make_graph(report_data):
     global _graph_buf
     names = [r['name']      for r in report_data]
@@ -184,7 +211,7 @@ def make_graph(report_data):
         _graph_buf = buf.read()
 
 
-# ── Routes ───────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 @app.route('/graph')
 def serve_graph():
     with _graph_lock:
@@ -240,13 +267,10 @@ def index():
             # Consistent smoothing (+1) matching load_data()
             ratio = round((amount / (balance + 1)) * 100, 1)
 
-            # FIX 4: Ratio penalty only for Withdrawal (0) and Transfer (2)
-            # Payment (3) and Credit (1) do NOT get ratio penalty
+            # Ratio penalty only for Withdrawal (0) and Transfer (2)
             ratio_penalty = (ratio > 60 and t_type in [0, 2]) * 30
 
-            # FIX 5: Login risk scales with actual attempts (capped at 10)
-            # Old: flat 30 pts for any login > 3
-            # New: proportional — 5 pts per attempt above 3, max 35 pts
+            # Login risk scales with actual attempts (proportional, capped)
             login_risk = min(max(login - 3, 0) * 5, 35) if login > 3 else 0
 
             ctx['detail'] = {
@@ -273,7 +297,7 @@ def index():
     return render_template('index.html', **ctx)
 
 
-# ── Startup ──────────────────────────────────────────────────────────────────
+# ── Startup ───────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     print("\n  Bank Fraud Detection server starting...")
     build_cache()
