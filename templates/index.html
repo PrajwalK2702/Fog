@@ -10,7 +10,6 @@
 <body>
 <div class="page">
 
-  <!-- Header -->
   <div class="header">
     <div class="hicon">
       <svg viewBox="0 0 24 24">
@@ -26,10 +25,7 @@
     </div>
   </div>
 
-  <!-- Form + Result -->
   <div class="top">
-
-    <!-- Transaction Form -->
     <div class="card">
       <div class="card-title">Transaction Input</div>
       <form method="POST" id="predict-form">
@@ -44,10 +40,10 @@
           <label for="type">Transaction Type</label>
           <select id="type" name="type" required>
             <option value="" disabled {% if not sel_type %}selected{% endif %}>Select type</option>
-            <option value="0" {% if sel_type=='0' %}selected{% endif %}>0 &mdash; Debit</option>
-            <option value="1" {% if sel_type=='1' %}selected{% endif %}>1 &mdash; Credit</option>
+            <option value="0" {% if sel_type=='0' %}selected{% endif %}>0 &mdash; Credit</option>
+            <option value="1" {% if sel_type=='1' %}selected{% endif %}>1 &mdash; Payment</option>
             <option value="2" {% if sel_type=='2' %}selected{% endif %}>2 &mdash; Transfer</option>
-            <option value="3" {% if sel_type=='3' %}selected{% endif %}>3 &mdash; Payment</option>
+            <option value="3" {% if sel_type=='3' %}selected{% endif %}>3 &mdash; Withdrawal</option>
           </select>
         </div>
 
@@ -57,7 +53,6 @@
                  min="18" max="100" required value="{{ age }}">
         </div>
 
-        <!-- FIX 7: min changed from 1 to 0 — 0 login attempts is valid -->
         <div class="field">
           <label for="login">Login Attempts</label>
           <input id="login" name="login" type="number" placeholder="e.g. 1"
@@ -74,7 +69,6 @@
       </form>
     </div>
 
-    <!-- Result Panel -->
     <div>
       {% if error %}
         <div class="error-box">&#9888; {{ error }}</div>
@@ -105,6 +99,7 @@
           <div class="risk-label">Risk score: {{ detail.risk_score }}/100</div>
 
           <div class="detail-grid">
+            <div class="di"><div class="dl">Type</div><div class="dv">{{ detail.type }}</div></div>
             <div class="di"><div class="dl">Amount</div><div class="dv">${{ detail.amount }}</div></div>
             <div class="di"><div class="dl">Balance</div><div class="dv">${{ detail.balance }}</div></div>
             <div class="di"><div class="dl">Amt / Balance</div><div class="dv">{{ detail.ratio }}%</div></div>
@@ -129,7 +124,6 @@
     </div>
   </div>
 
-  <!-- Model Results Table -->
   {% if report_data %}
   <div class="section-label">All 15 Models &mdash; Sorted by Accuracy</div>
   <div class="card">
@@ -143,7 +137,6 @@
             <th>Precision</th>
             <th>Recall</th>
             <th>F1 Score</th>
-            <!-- FIX 6 & 9: Added Prediction column so users can see per-model verdict -->
             <th>Prediction</th>
           </tr>
         </thead>
@@ -159,7 +152,6 @@
             <td><span class="pill {% if row.precision >= 0.9 %}ph{% elif row.precision >= 0.7 %}pm{% else %}pl{% endif %}">{{ (row.precision*100)|round(1) }}%</span></td>
             <td><span class="pill {% if row.recall    >= 0.9 %}ph{% elif row.recall    >= 0.7 %}pm{% else %}pl{% endif %}">{{ (row.recall   *100)|round(1) }}%</span></td>
             <td><span class="pill {% if row.f1        >= 0.9 %}ph{% elif row.f1        >= 0.7 %}pm{% else %}pl{% endif %}">{{ (row.f1       *100)|round(1) }}%</span></td>
-            <!-- FIX 6: Show each model's individual prediction -->
             <td>
               {% if row.prediction == 1 %}
                 <span class="pill pl">&#128680; Fraud</span>
@@ -174,7 +166,6 @@
     </div>
   </div>
 
-  <!-- Model Comparison Graph -->
   <div class="card graph-card">
     <div class="card-title">Model Comparison Graph</div>
     <img src="/graph" alt="Model Accuracy Comparison Bar Chart">
@@ -183,7 +174,6 @@
 
 </div>
 
-<!-- Loading spinner on submit -->
 <script>
   document.getElementById('predict-form').addEventListener('submit', function () {
     const btn = document.getElementById('submit-btn');
